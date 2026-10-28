@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+runs/
+dist/
+external/
+.env
+vendor/flash_cuda/.fa*_trials/
