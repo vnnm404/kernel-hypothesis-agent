@@ -18,7 +18,7 @@ class WrapperTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='kernel wrapper ')
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        for name in ('run.sh',):
+        for name in ('run.sh', 'experiment.py'):
             shutil.copy2(ROOT / name, self.root / name)
         self.flash = self.root / 'existing flash'
         (self.flash / 'bench').mkdir(parents=True)
@@ -42,6 +42,12 @@ if __name__ == '__main__':
   print('correct: 2/3   unsupported: 1   wrong: 0')
   print('perf over 2 configs: geomean=1.0x')
  else:
+  from pathlib import Path
+  if os.environ.get('SLOW_SEARCH') and not os.environ.get('KHA_PHASE'):
+   import time; time.sleep(60)
+  latency = 80.0 if Path(sys.argv[sys.argv.index('--cand')+1]).read_text() == 'changed kernel' else 100.0
+  for suffix in ('causal', 'noncausal', 'gqa'):
+   print('  OK attn_dense_hd128_'+suffix+f' 1.000x (FA4 100.0us / ours {latency:.1f}us)')
   print('correct: 3/3   unsupported: 0   wrong: 0')
   print('perf over 3 configs: geomean=1.0x')
 ''')
@@ -51,8 +57,21 @@ if __name__ == '__main__':
         claude = bins / 'claude'
         claude.write_text(f'#!{sys.executable}\n' + '''import json, os, sys
 from pathlib import Path
+if '--help' in sys.argv:
+ print('--safe-mode --no-session-persistence'); sys.exit(0)
+if '--version' in sys.argv:
+ print('fixture-claude'); sys.exit(0)
 Path(os.environ['CLAUDE_LOG']).write_text(json.dumps({'argv': sys.argv, 'stdin': sys.stdin.read(),
  'key': os.environ.get('ANTHROPIC_API_KEY'), 'url': os.environ.get('ANTHROPIC_BASE_URL')}))
+print(json.dumps({'type':'system', 'subtype':'init', 'model':'fixture-model'}))
+if os.environ.get('AGENT_SLEEP'):
+ import time; time.sleep(60)
+for i in range(int(os.environ.get('SEARCH_COUNT', '0'))):
+ import subprocess
+ Path('candidate.cu').write_text('changed kernel')
+ Path('notes.md').write_text(f'Attempt {i+1}')
+ r = subprocess.run(['bash', './benchmark.sh'], capture_output=True, text=True)
+ print(json.dumps({'type':'user', 'message': {'content': r.stdout + r.stderr}}))
 if not os.environ.get('NO_RESULT'):
  Path('result.md').write_text('Fixture result; no real GPU or model used.')
 if os.environ.get('CHANGE_BEST'):
@@ -67,6 +86,8 @@ print(json.dumps({'type':'result', 'is_error': bool(os.environ.get('AGENT_ERROR'
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(('ANTHROPIC_', 'CLAUDE_', 'OPENAI_'))}
         self.env = env | {'PATH': f'{bins}:/usr/bin:/bin', 'PYTHON_BIN': sys.executable, 'SNOWFLAKE_PAT_FILE': str(self.pat),
+                          'KHA_TRIAL_DIR': str(self.root / 'runs/single'), 'REPEATS': '1',
+                          'PAIRS': '2', 'BENCHMARKS': '2', 'SECONDS_PER_RUN': '10',
                           'CALL_LOG': str(self.root / 'calls'), 'CLAUDE_LOG': str(self.root / 'claude-call')}
 
     def run_wrapper(self, *args, **env):
@@ -169,7 +190,7 @@ elif a[0] == '-C':
         calls = self.calls()
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][calls[0].index('--namespace') + 1], 'FA3_LIB_NAME')
-        self.assertTrue(calls[1][calls[1].index('--cand') + 1].endswith('/best.cu'))
+        self.assertEqual((self.root / 'runs/single/measurements/0002/kernel.cu').read_text(), 'changed kernel')
         argv = self.claude_call()['argv']
         self.assertIn('configured-model', argv)
         self.assertNotIn('claude-opus-5[1m]', argv)
@@ -268,6 +289,88 @@ elif a[0] == '-C':
         r = self.run_wrapper(str(self.flash), NO_RESULT='1')
         self.assertNotEqual(r.returncode, 0)
         self.assertIn('did not write result.md', r.stderr)
+
+    def batch(self):
+        return next((self.root / 'runs').glob('experiment-*'))
+
+    def test_paired_dataset_balanced_order_snapshots_and_measured_gain(self):
+        import csv
+        import hashlib
+        r = self.run_wrapper(str(self.flash), KHA_TRIAL_DIR='', SEARCH_COUNT='2', CHANGE_BEST='1', REPEATS='2')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        batch = self.batch()
+        manifest = json.loads((batch / 'experiment.json').read_text())
+        self.assertEqual(manifest['gpu_index'], 0)
+        self.assertEqual([v[1] for v in manifest['schedule'] if v[2] == 1].count('baseline'), 1)
+        summary = list(csv.DictReader((batch / 'summary.csv').read_text().splitlines()))
+        self.assertEqual(len(summary), 4)
+        self.assertTrue(all(float(v['final_speedup_vs_seed']) == 1.25 for v in summary))
+        self.assertTrue(all(v['qualifies'] == 'True' for v in summary))
+        rows = [json.loads(line) for line in (batch / 'measurements.jsonl').read_text().splitlines()]
+        self.assertEqual(len(rows), 24)  # 4 sessions x (2 seed + 2 search + 2 final).
+        self.assertEqual(sum(len(v['cases']) for v in rows), 72)
+        self.assertEqual(len({v['kernel_sha256'] for v in rows if v['phase'] == 'seed'}), 1)
+        for v in rows:
+            trial = batch / v['trial_id']
+            self.assertEqual(hashlib.sha256((trial/v['snapshot']).read_bytes()).hexdigest(), v['kernel_sha256'])
+            if v['phase'] == 'search':
+                self.assertIsNotNone(v['agent_elapsed_s'])
+                self.assertTrue((trial / 'measurements' / v['measurement_id'] / 'notes.md').is_file())
+        for trial in batch.glob('pair-*'):
+            text = (trial / 'instructions.md').read_text()
+            self.assertEqual('smallest test' in text, trial.name.endswith('guided'))
+        call = self.claude_call()
+        self.assertIn('--no-session-persistence', call['argv'])
+        self.assertIn('--safe-mode', call['argv'])
+        self.assertNoSecret(r, PAT)
+
+    def test_search_budget_is_enforced_and_rejections_are_recorded(self):
+        r = self.run_wrapper(str(self.flash), KHA_TRIAL_DIR='', SEARCH_COUNT='3', PAIRS='1')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for trial in self.batch().glob('pair-*'):
+            ev = [json.loads(s) for s in (trial/'events.jsonl').read_text().splitlines()]
+            self.assertEqual(sum(e['event'] == 'budget_exhausted' for e in ev), 1)
+            self.assertEqual(sum(e['event'] == 'benchmark_start' and e['phase'] == 'search' for e in ev), 2)
+
+    def test_failed_trials_stay_in_aggregate_dataset(self):
+        r = self.run_wrapper(str(self.flash), KHA_TRIAL_DIR='', BAD_BENCH='1')
+        self.assertNotEqual(r.returncode, 0)
+        summaries = [json.loads(p.read_text()) for p in self.batch().glob('pair-*/summary.json')]
+        self.assertEqual(len(summaries), 4)
+        self.assertTrue(all(s['status'] == 'failed' and s['final_speedup_vs_seed'] is None for s in summaries))
+        rows = [json.loads(s) for s in (self.batch()/'measurements.jsonl').read_text().splitlines()]
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(not r['valid'] for r in rows))
+
+    def test_timeout_retains_unfinished_benchmark(self):
+        r = self.run_wrapper(str(self.flash), KHA_TRIAL_DIR='', SEARCH_COUNT='1',
+                             SLOW_SEARCH='1', SECONDS_PER_RUN='1', PAIRS='1')
+        self.assertNotEqual(r.returncode, 0)
+        for trial in self.batch().glob('pair-*'):
+            summary = json.loads((trial/'summary.json').read_text())
+            self.assertEqual(summary['agent_exit_code'], 124)
+            ev = [json.loads(s) for s in (trial/'events.jsonl').read_text().splitlines()]
+            interrupted = [e for e in ev if e.get('error', '').startswith('interrupted')]
+            self.assertEqual(len(interrupted), 1)
+            self.assertFalse(interrupted[0]['valid'])
+
+    def test_comparison_rejects_resumed_sessions(self):
+        r = self.run_wrapper(str(self.flash), '--resume', 'old-session', KHA_TRIAL_DIR='')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('only Claude --model and --effort', r.stderr)
+
+    def test_missing_candidate_still_has_a_structured_failure_record(self):
+        r = self.run_wrapper('--check', str(self.flash))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        trial = self.root / 'runs/single'
+        r = subprocess.run([sys.executable, str(self.root/'experiment.py'), 'measure', 'missing.cu'],
+                           cwd=trial, env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        record = json.loads((trial/'measurements/0002/measurement.json').read_text())
+        self.assertFalse(record['valid'])
+        self.assertIsNone(record['kernel_sha256'])
+        self.assertIn('missing.cu', record['error'])
+        self.assertTrue((trial/record['log']).is_file())
 
 
 if __name__ == '__main__':

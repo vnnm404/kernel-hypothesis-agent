@@ -15,6 +15,7 @@ GPU=${GPU:-0}
 export PYTHONDONTWRITEBYTECODE=1
 if [[ "$CHECK" == 0 ]]; then
   command -v claude >/dev/null || { echo 'Claude is not on PATH. Use your normal Claude environment.' >&2; exit 1; }
+  claude --help | grep -- '--safe-mode' >/dev/null || { echo 'Update Claude Code: --safe-mode support is required.' >&2; exit 1; }
   # Default: Snowflake endpoint with the PAT file. Another endpoint needs ANTHROPIC_BASE_URL
   # set with its credentials, so a non-Snowflake key is never sent to Snowflake by default.
   SNOWFLAKE_URL=https://snowhouse.snowflakecomputing.com/api/v2/cortex/anthropic
@@ -100,7 +101,14 @@ except Exception as e:
     sys.exit(f'Benchmark environment is not ready: {e}\nCheck the CUDA toolkit/driver and the setup output above.')
 PY
 mkdir -p "$ROOT/runs"
-OUT=$(mktemp -d "$ROOT/runs/run-XXXXXXXX")
+if [[ "$CHECK" == 0 && "$SMOKE" == 0 && -z "${KHA_TRIAL_DIR:-}" ]]; then
+  exec "$PY" "$ROOT/experiment.py" run "$FLASH" "$@"
+fi
+OUT=${KHA_TRIAL_DIR:-$(mktemp -d "$ROOT/runs/run-XXXXXXXX")}
+mkdir -p "$OUT"
+REPEATS=${REPEATS:-3}
+[[ "$CHECK" == 0 && "$SMOKE" == 0 ]] || REPEATS=1
+BENCHMARKS=${BENCHMARKS:-12}
 # Stage only the existing benchmark files, so its builds/reports stay in this run.
 mkdir -p "$OUT/bench"
 cp "$FLASH/bench/"{__init__,eval,scenarios}.py "$OUT/bench/"
@@ -125,13 +133,11 @@ inline PTX; do not replace the kernel with library calls or specialize on input 
 
 Use ./benchmark.sh to check correctness and measure all three workloads. It saves
 each output in measurements/. Run measurements sequentially on the selected GPU.
-Make at most three optimization attempts, keeping a source snapshot for each.
-Before each change, write down what you think limits performance, the evidence,
-and what result would disprove that explanation.
-
-If two changes fail to improve performance, stop guessing. Name two competing
-explanations and run the smallest test that distinguishes them. Record what the
-test establishes, what remains uncertain, and how it changes your next step.
+Use only this trial's files; do not inspect other trials or prior sessions.
+Do not edit run.json, events.jsonl, measurements/, or .evaluation/.
+Before each benchmark, append a short description of the change to notes.md.
+Use only ./benchmark.sh for scored evaluations. Failed evaluations and repeated
+measurements consume the same search budget. Source snapshots are saved automatically.
 If profiling counters are unavailable, save the error and use another test.
 Treat deliberately incorrect ablations only as diagnostics, never as improvements.
 
@@ -141,43 +147,44 @@ no case gets more than 3% slower. Save the best verified version as best.cu;
 leave it equal to seed.cu if no change qualifies. These decisions are your
 responsibility; the wrapper only checks the seed and final best with the benchmark.
 
-Write result.md with the tested explanations, changes, per-case measurements,
+Write result.md with the changes, per-case measurements,
 failed attempts, evidence filenames, and next experiment. Distinguish measured
 results from guesses. Do not change the environment, install packages, or call
-other agents. Stop after the three attempts and report honestly if blocked.
+other agents. Report honestly if blocked. Save best.cu and result.md before stopping.
 TASK
+  printf '\nBudget: at most %s search benchmark calls and %s seconds of agent time.\n' "$BENCHMARKS" "${SECONDS_PER_RUN:-3600}" >> "$OUT/instructions.md"
+  if [[ "${KHA_CONDITION:-guided}" == guided ]]; then
+    cat >> "$OUT/instructions.md" <<'GUIDED'
+Before each change, record the suspected bottleneck, supporting evidence, and a
+prediction that could disprove it in notes.md. If two changes fail to improve
+performance, name two competing explanations and run the smallest test that
+distinguishes them. Record what it establishes and how it changes your next step.
+GUIDED
+  fi
 fi
 git -C "$FLASH" rev-parse HEAD > "$OUT/source-commit.txt" 2>/dev/null || true
-# The original evaluator stringifies FA3_LIB_NAME in TORCH_LIBRARY.
+# The helper snapshots inputs and records every benchmark, including failures.
 {
   printf '#!/usr/bin/env bash\nset -euo pipefail\ncd %q\n' "$OUT"
-  printf 'PY=%q\nGPU=%q\n' "$PY" "$GPU"
-  cat <<'BENCH'
-mkdir -p measurements
-LOG=$(mktemp "$PWD/measurements/bench-XXXXXXXX")
-"$PY" -m bench.eval --target blackwell --cand "${1:-$PWD/candidate.cu}" \
-  --namespace FA3_LIB_NAME --gpu "$GPU" --set all --no-cudnn --no-flashinfer \
-  --configs attn_dense_hd128_causal,attn_dense_hd128_noncausal,attn_dense_hd128_gqa | tee "$LOG"
-# Upstream can exit zero for unsupported cases; require full correctness and timing.
-grep -Eq '^correct: 3/3 +unsupported: 0 +wrong: 0' "$LOG" && \
-  grep -q '^perf over 3 configs:' "$LOG" || { echo "Incomplete/failed benchmark: $LOG" >&2; exit 1; }
-BENCH
+  printf 'exec %q %q measure "$@"\n' "$PY" "$ROOT/experiment.py"
 } > "$OUT/benchmark.sh"
 chmod +x "$OUT/benchmark.sh"
 cd "$OUT"
 export PYTHONPATH="$OUT${PYTHONPATH:+:$PYTHONPATH}"
+export GPU BENCHMARKS
+"$PY" "$ROOT/experiment.py" init
 echo "Results: $OUT"
-./benchmark.sh | tee seed.log
+for ((i=0; i<REPEATS; i++)); do
+  KHA_PHASE=seed "$PY" "$ROOT/experiment.py" benchmark "$OUT/seed.cu"
+done | tee seed.log
 if [[ "$CHECK" == 1 ]]; then echo "GPU check passed: $OUT"; exit 0; fi
 echo "Running Claude. Trace: $OUT/trace.jsonl"
-TOOLS='Read,Write,Edit,Bash,Glob,Grep'
-[[ "$SMOKE" == 0 ]] || TOOLS='Read,Write'
+export KHA_SMOKE=$SMOKE
 # File-loaded credentials are passed only to Claude; they are never printed.
 (
   export ANTHROPIC_BASE_URL=$BASE_URL
   [[ -z "$KEY" ]] || export ANTHROPIC_API_KEY=$KEY
-  exec claude -p --verbose --output-format stream-json \
-    --allowedTools "$TOOLS" "$@" < instructions.md > trace.jsonl
+  exec "$PY" "$ROOT/experiment.py" agent "$@"
 )
 "$PY" - <<'PY'
 import json
@@ -192,10 +199,10 @@ PY
 if [[ "$SMOKE" == 1 ]] && ! { cmp -s seed.cu candidate.cu && cmp -s seed.cu best.cu; }; then
   echo 'Smoke test failed: Claude changed candidate.cu or best.cu.' >&2; exit 1
 fi
-# Same bytes: benchmark candidate.cu so an up-to-date build is reused; checks and timings rerun.
-FINAL="$OUT/best.cu"
-cmp -s best.cu candidate.cu && FINAL="$OUT/candidate.cu"
-./benchmark.sh "$FINAL" | tee final.log
+# Independently remeasure the selected kernel; the recorder reuses identical builds.
+for ((i=0; i<REPEATS; i++)); do
+  KHA_PHASE=final "$PY" "$ROOT/experiment.py" benchmark "$OUT/best.cu"
+done | tee final.log
 if [[ "$SMOKE" == 1 ]]; then
   echo "Smoke test passed (no optimization attempted). Read $OUT/result.md and $OUT/final.log"
 else
