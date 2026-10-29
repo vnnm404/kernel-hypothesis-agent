@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Use the existing flash-cuda environment and installed Claude Code; install nothing.
+# Set up the benchmark locally, then run the installed Claude Code.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
 CHECK=0 SMOKE=0
 if [[ "${1:-}" == --check ]]; then CHECK=1; shift; elif [[ "${1:-}" == --smoke ]]; then SMOKE=1; shift; fi
-if [[ $# -eq 0 || "${1:-}" == --help ]]; then
-  echo 'Usage: ./run.sh [--check|--smoke] /path/to/flash-cuda [Claude options]'
+if [[ "${1:-}" == --help ]]; then
+  echo 'Usage: ./run.sh [--check|--smoke] [existing-flash-cuda-path] [Claude options]'
   exit 0
 fi
-FLASH=$(cd "$1" && pwd); shift
-PY=$(command -v "${PYTHON_BIN:-python3}")
+# An optional checkout path retains support for an already prepared environment.
+FLASH=""
+if [[ $# -gt 0 && "$1" != -* ]]; then FLASH=$(cd "$1" && pwd); shift; fi
 GPU=${GPU:-0}
 export PYTHONDONTWRITEBYTECODE=1
 if [[ "$CHECK" == 0 ]]; then
@@ -40,7 +41,45 @@ if [[ "$CHECK" == 0 ]]; then
     [[ "$MODEL" == 0 ]] || set -- --model 'claude-opus-5[1m]' "$@"
   fi
 fi
-command -v nvcc >/dev/null || { echo 'nvcc is not on PATH. Activate your working flash-cuda environment.' >&2; exit 1; }
+command -v nvcc >/dev/null || { echo 'CUDA 13 toolkit required: nvcc is not on PATH.' >&2; exit 1; }
+if [[ -z "$FLASH" ]]; then
+  for tool in git curl g++; do
+    command -v "$tool" >/dev/null || { echo "Required system tool missing: $tool" >&2; exit 1; }
+  done
+  nvcc --version | grep -q 'release 13\.' || { echo 'This setup requires CUDA 13.' >&2; exit 1; }
+  DEPS="$ROOT/.deps"
+  mkdir -p "$DEPS"
+  export UV_PYTHON_INSTALL_DIR="$DEPS/python" UV_CACHE_DIR="$DEPS/cache"
+  # Managed downloads stay here; neither shell profiles nor system Python are changed.
+  UV="$DEPS/bin/uv"
+  if [[ ! -x "$UV" ]]; then
+    curl -fsSL https://astral.sh/uv/0.11.29/install.sh -o "$DEPS/install-uv.sh"
+    UV_UNMANAGED_INSTALL="$DEPS/bin" sh "$DEPS/install-uv.sh"
+  fi
+  checkout() {
+    local name=$1 url=$2 commit=$3
+    if [[ ! -d "$DEPS/$name/.git" ]]; then
+      git init -q "$DEPS/$name"
+      git -C "$DEPS/$name" remote add origin "$url"
+    fi
+    if [[ "$(git -C "$DEPS/$name" rev-parse HEAD 2>/dev/null || true)" != "$commit" ]]; then
+      git -C "$DEPS/$name" fetch --depth 1 origin "$commit"
+      git -C "$DEPS/$name" checkout --detach FETCH_HEAD
+    fi
+  }
+  checkout flash-cuda https://github.com/Snowflake-AI-Research/flash-cuda.git 74af5ce7d2849f2c33f9017fa6f896b9c991a0e3
+  checkout flash-attention https://github.com/Dao-AILab/flash-attention.git df61ab6c4a0fb1f94f1f43b2a23479a0ab92b8ab
+  FLASH="$DEPS/flash-cuda"
+  PY="$DEPS/venv/bin/python"
+  if [[ ! -x "$PY" ]]; then "$UV" venv --python 3.12 "$DEPS/venv"; fi
+  # Match the tested B200 stack. FA4/quack's upstream .dev0 CUTLASS pin is broken.
+  "$UV" pip install --python "$PY" torch==2.9.1 --index-url https://download.pytorch.org/whl/cu130
+  "$UV" pip install --python "$PY" ninja 'nvidia-cutlass-dsl[cu13]==4.6.1' einops typing_extensions 'apache-tvm-ffi>=0.1.12,<0.2' torch-c-dlpack-ext
+  "$UV" pip install --python "$PY" --no-deps quack-kernels==0.5.3 "$DEPS/flash-attention/flash_attn/cute"
+  export PATH="$DEPS/venv/bin:$PATH"
+else
+  PY=$(command -v "${PYTHON_BIN:-python3}")
+fi
 for file in bench/__init__.py bench/eval.py bench/scenarios.py kernels/fa4_blackwell.cu; do
   [[ -f "$FLASH/$file" ]] || { echo "Missing $FLASH/$file" >&2; exit 1; }
 done
@@ -58,7 +97,7 @@ try:
     assert all(n in names for n in ('attn_dense_hd128_causal', 'attn_dense_hd128_noncausal', 'attn_dense_hd128_gqa')), 'Expected benchmark cases are missing'
     print('Ready:', torch.cuda.get_device_name())
 except Exception as e:
-    sys.exit(f'Benchmark environment is not ready: {e}\nUse the Python environment that already runs flash-cuda.')
+    sys.exit(f'Benchmark environment is not ready: {e}\nCheck the CUDA toolkit/driver and the setup output above.')
 PY
 mkdir -p "$ROOT/runs"
 OUT=$(mktemp -d "$ROOT/runs/run-XXXXXXXX")
@@ -76,7 +115,37 @@ existing file. Write result.md starting with the line "Smoke test only; no optim
 attempted." followed by the correctness and perf lines copied exactly from seed.log.
 SMOKE
 else
-  cp "$ROOT/prompt.md" "$OUT/instructions.md"
+  cat > "$OUT/instructions.md" <<'TASK'
+Improve candidate.cu using this existing FlashAttention benchmark.
+
+Start by reading seed.log and the source. Work only in this run directory.
+Keep seed.cu, benchmark.sh, bench/, instructions.md, and existing logs unchanged.
+Preserve the kernel API, supported inputs, and numerical behavior. Use CUDA and
+inline PTX; do not replace the kernel with library calls or specialize on input values.
+
+Use ./benchmark.sh to check correctness and measure all three workloads. It saves
+each output in measurements/. Run measurements sequentially on the selected GPU.
+Make at most three optimization attempts, keeping a source snapshot for each.
+Before each change, write down what you think limits performance, the evidence,
+and what result would disprove that explanation.
+
+If two changes fail to improve performance, stop guessing. Name two competing
+explanations and run the smallest test that distinguishes them. Record what the
+test establishes, what remains uncertain, and how it changes your next step.
+If profiling counters are unavailable, save the error and use another test.
+Treat deliberately incorrect ablations only as diagnostics, never as improvements.
+
+Recheck promising changes against the previous best using repeated runs. Keep a
+change only if all cases pass, geometric-mean latency improves by at least 2%, and
+no case gets more than 3% slower. Save the best verified version as best.cu;
+leave it equal to seed.cu if no change qualifies. These decisions are your
+responsibility; the wrapper only checks the seed and final best with the benchmark.
+
+Write result.md with the tested explanations, changes, per-case measurements,
+failed attempts, evidence filenames, and next experiment. Distinguish measured
+results from guesses. Do not change the environment, install packages, or call
+other agents. Stop after the three attempts and report honestly if blocked.
+TASK
 fi
 git -C "$FLASH" rev-parse HEAD > "$OUT/source-commit.txt" 2>/dev/null || true
 # The original evaluator stringifies FA3_LIB_NAME in TORCH_LIBRARY.

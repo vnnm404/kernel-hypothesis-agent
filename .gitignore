@@ -10,3 +10,4 @@ dist/
 external/
 .env
 vendor/flash_cuda/.fa*_trials/
+.deps/

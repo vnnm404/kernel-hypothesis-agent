@@ -18,7 +18,7 @@ class WrapperTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='kernel wrapper ')
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        for name in ('run.sh', 'prompt.md'):
+        for name in ('run.sh',):
             shutil.copy2(ROOT / name, self.root / name)
         self.flash = self.root / 'existing flash'
         (self.flash / 'bench').mkdir(parents=True)
@@ -78,6 +78,74 @@ print(json.dumps({'type':'result', 'is_error': bool(os.environ.get('AGENT_ERROR'
 
     def claude_call(self):
         return json.loads((self.root / 'claude-call').read_text())
+
+    def mock_downloads(self):
+        """Exercise first-run setup without network traffic or CUDA packages."""
+        bins = self.root / 'bin'
+        (bins / 'nvcc').write_text("#!/bin/sh\necho 'Cuda compilation tools, release 13.0'\n")
+        (bins / 'g++').write_text('#!/bin/sh\nexit 0\n')
+        uv = self.root / 'fake-uv'
+        uv.write_text(f'#!{sys.executable}\n' + '''import json, os, sys, shlex
+from pathlib import Path
+with open(os.environ['SETUP_LOG'], 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')
+if os.environ.get('FAIL_INSTALL') and sys.argv[1] == 'pip': sys.exit(1)
+if sys.argv[1] == 'venv':
+ p = Path(sys.argv[-1]) / 'bin/python'
+ p.parent.mkdir(parents=True, exist_ok=True)
+ p.write_text('#!/bin/sh\\nexec '+shlex.quote(sys.executable)+' "$@"\\n')
+ p.chmod(0o755)
+''')
+        uv.chmod(0o755)
+        (bins / 'curl').write_text(f'#!{sys.executable}\n' + '''import sys
+from pathlib import Path
+Path(sys.argv[sys.argv.index('-o')+1]).write_text('#!/bin/sh\\nmkdir -p "$UV_UNMANAGED_INSTALL"\\ncp "$FAKE_UV" "$UV_UNMANAGED_INSTALL/uv"\\n')
+''')
+        (bins / 'git').write_text(f'#!{sys.executable}\n' + '''import os, shutil, sys
+from pathlib import Path
+a = sys.argv[1:]
+if a[0] == 'init':
+ (Path(a[-1]) / '.git').mkdir(parents=True)
+elif a[0] == '-C':
+ dest, op = Path(a[1]), a[2]
+ if op == 'rev-parse':
+  if not (dest / '.git/revision').exists(): sys.exit(1)
+  print((dest / '.git/revision').read_text())
+ elif op == 'fetch': (dest / '.git/revision').write_text(a[-1])
+ elif op == 'checkout' and dest.name == 'flash-cuda':
+  shutil.copytree(os.environ['FIXTURE_FLASH'], dest, dirs_exist_ok=True)
+''')
+        for p in bins.iterdir():
+            p.chmod(0o755)
+        self.env.update(FAKE_UV=str(uv), SETUP_LOG=str(self.root / 'setup-log'),
+                        FIXTURE_FLASH=str(self.flash), PYTHONPATH=str(self.flash))
+
+    def test_no_path_sets_up_dependencies_and_reuses_environment(self):
+        self.mock_downloads()
+        for _ in range(2):
+            r = self.run_wrapper('--smoke')
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        calls = [json.loads(s) for s in (self.root / 'setup-log').read_text().splitlines()]
+        self.assertEqual(sum(c[0] == 'venv' for c in calls), 1)
+        self.assertTrue(any('torch==2.9.1' in c for c in calls))
+        self.assertTrue(any('--no-deps' in c and 'quack-kernels==0.5.3' in c for c in calls))
+        self.assertEqual(len(self.calls()), 4)
+        self.assertNoSecret(r, PAT)
+
+    def test_setup_failure_stops_before_gpu_and_can_be_retried(self):
+        self.mock_downloads()
+        r = self.run_wrapper('--smoke', FAIL_INSTALL='1')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse((self.root / 'calls').exists())
+        self.assertFalse((self.root / 'claude-call').exists())
+        r = self.run_wrapper('--smoke')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_missing_pat_with_no_path_stops_before_downloads(self):
+        self.mock_downloads()
+        self.pat.unlink()
+        r = self.run_wrapper()
+        self.assertStoppedBeforeGpu(r, 'needs your PAT')
+        self.assertFalse((self.root / '.deps').exists())
 
     def assertNoSecret(self, r, *secrets):
         runs = [p.read_text() for p in (self.root / 'runs').rglob('*') if p.is_file()]
