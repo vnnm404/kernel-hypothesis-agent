@@ -57,8 +57,7 @@ Pass a configured profile with `--agent-arg=--profile --agent-arg=PROFILE` if ne
 
 ```bash
 export KHA_MODEL='YOUR_APPROVED_EXPLICIT_MODEL_ID'
-CONFIG=experiments/blackwell.json BACKEND=claude GPU=0 REPETITIONS=3 \
-  OUT_DIR=runs/b200-pilot ./scripts/run_experiment.sh
+./run.sh pilot --backend claude --model "$KHA_MODEL"
 ```
 
 Claude uses `-p`, JSONL output and pre-approved read/edit/shell tools; Codex uses
@@ -74,15 +73,23 @@ Claude session. For research, record the provider/model revision as well as its 
 
 ## One-task pilot before the campaign
 
+On B200, `./run.sh setup` installs the tested FA4 dependencies in `.venv-gpu`.
+If using an existing approved GPU Python environment, skip that step.
+
 ```bash
-kha doctor --config experiments/blackwell.json --backend claude --gpu 0
-kha evaluate --config experiments/blackwell.json --gpu 0 --out runs/seed-check
-kha run --config experiments/blackwell.json --backend claude --model "$KHA_MODEL" \
-  --gpu 0 --arm hypothesis --out runs/first-agent
+./run.sh check
+./run.sh pilot --backend claude --model "$KHA_MODEL" --rounds 1
 ```
 
-Read the seed-check logs first. These commands actually compile and execute kernels.
-No GPU or paid CLI run was performed while building the initial repository on macOS.
+The pilot is bounded to 15 minutes by default. Cold compilation can take several
+minutes; compiled kernels are reused across evaluator processes, while correctness
+and timing are always rerun. After the pilot works:
+
+```bash
+./run.sh campaign --backend claude --model "$KHA_MODEL"
+```
+
+See [validation](validation.md) for measured hardware coverage and remaining limits.
 
 ## FastKernels task (including GEMM)
 

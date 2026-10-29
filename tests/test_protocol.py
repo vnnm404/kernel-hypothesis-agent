@@ -102,3 +102,20 @@ def test_plateau_requires_competing_test_and_revision(tmp_path):
     outcome["evidence_files"] = ["../missing.txt"]
     with pytest.raises(ValueError):
         validate_outcome(outcome, plan, tmp_path, True)
+
+
+def test_empty_stderr_is_allowed_but_empty_diagnostic_is_not(tmp_path):
+    (tmp_path / "evidence").mkdir()
+    (tmp_path / "evidence/stderr.log").touch()
+    (tmp_path / "evidence/stdout.log").write_text("observed permission failure")
+    plan = {"kind": "diagnostic"}
+    outcome = dict(
+        observation="o",
+        interpretation="i",
+        next_action="n",
+        evidence_files=["evidence/stdout.log", "evidence/stderr.log"],
+    )
+    validate_outcome(outcome, plan, tmp_path, False)
+    (tmp_path / "evidence/stdout.log").write_text("")
+    with pytest.raises(ValueError, match="all empty"):
+        validate_outcome(outcome, plan, tmp_path, False)

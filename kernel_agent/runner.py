@@ -136,9 +136,10 @@ raise SystemExit(main(["gpu", "--gpu", {gpu!r}, "--lock-dir", {str(locks)!r},
     "--timeout", "600", "--out", "evidence", "--", *sys.argv[1:]]))
 """
     (work / "with_gpu.py").write_text(wrapper)
-    (work / "profile.py").write_text("""import sys
+    (work / "profile_kernel.py").write_text("""import sys
 from kernel_agent.probe import main
-main()
+if __name__ == "__main__":
+    main()
 """)
     return work
 

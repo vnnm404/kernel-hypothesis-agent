@@ -4,33 +4,49 @@ A runnable experiment in escaping GPU-kernel optimization plateaus. It layers an
 explicit hypothesis-testing procedure over Claude Code or Codex and compares it
 against the same coding agent with the same tools and a normal optimization loop.
 
-**This is an experimental agent, not a demonstrated improvement.** The included
-CPU smoke test proves controller plumbing only. GPU performance and real CLI
-integration must be validated on the target machine.
+**This is an experimental agent, not a demonstrated improvement.** The CPU smoke test proves controller plumbing only. See
+[validation notes](docs/validation.md) for exactly what has been exercised on real hardware.
 
 ## Quick start
 
-In your existing GPU Python environment (Python >=3.10):
+On a **B200 Linux host with CUDA 13** (`nvcc` on PATH), Python 3.10+, and git:
 
 ```bash
-python -m pip install -e '.[dev]'
-kha smoke --out runs/smoke                # no GPU, credentials or paid model calls
+git clone https://github.com/vnnm404/kernel-hypothesis-agent.git
+cd kernel-hypothesis-agent
+./run.sh setup
+./run.sh check
+./run.sh pilot --backend codex --model YOUR_APPROVED_MODEL_ID
 ```
 
-Then, on a configured Blackwell host:
+`setup` installs the GPU dependencies and pinned FA4 reference into `.venv-gpu`.
+`check` compiles the CUDA seed, checks all three workloads against the reference
+with three input seeds, and measures performance. **It makes no model calls.**
+`pilot` uses your already-authenticated Codex CLI; use `--backend claude` for Claude
+Code. It runs at most three rounds within 15 minutes (including compilation and
+agent calls). Both planning and implementation count toward that wall budget.
+Use `--rounds 1 --minutes 10` for a smaller first trial. Results and an HTML report
+are saved under `runs/`; the command prints the report path.
+
+Once the pilot works, run the comparison:
 
 ```bash
-export KHA_MODEL='YOUR_APPROVED_EXPLICIT_MODEL_ID'
-kha doctor --config experiments/blackwell.json --backend claude --gpu 0
-kha evaluate --config experiments/blackwell.json --gpu 0 --out runs/seed-check
-CONFIG=experiments/blackwell.json BACKEND=claude GPU=0 REPETITIONS=3 \
-  OUT_DIR=runs/b200-pilot ./scripts/run_experiment.sh
+./run.sh campaign --backend codex --model YOUR_APPROVED_MODEL_ID
 ```
 
-Use `experiments/hopper.json` on SM90, or `BACKEND=codex` with your configured Codex
-provider. [Snowflake setup](docs/snowflake.md) covers existing Cortex authentication,
-GPU dependencies, FastKernels tasks, profiling, and sharing results. Authentication
-is inherited; no secret values belong in this repo or CLI arguments.
+That runs three repetitions of each arm using the larger budgets in the task JSON.
+It can take hours. The short pilot is a functional check, not evidence of efficacy.
+Scripts do not rent GPUs or install/authenticate a coding CLI for you.
+
+Already have a working flash-cuda environment? Skip `setup`, install with
+`python -m pip install -e .`, and set `PYTHON_BIN` to that environment's Python
+(and `KHA_VENV` to a nonexistent path if `.venv-gpu` exists). On Hopper use
+`--config experiments/hopper.json` with an existing FA3/vLLM environment;
+**the automatic setup script currently targets B200 only**.
+
+CPU-only check: `python -m pip install -e '.[dev]' && ./run.sh smoke`.
+[Snowflake setup](docs/snowflake.md) covers existing Cortex authentication,
+FastKernels tasks, profiling, and sharing results.
 
 ## What changes between arms
 
@@ -65,6 +81,9 @@ included in the agent prompts.
 - Flash correctness across three input seeds by default. Every selected case must
   be correct, supported and have a working FA3/FA4 reference. Missing or skipped
   cases fail the evaluation rather than disappearing from a geometric mean.
+- Compiled CUDA binaries are cached by source, target flags, compiler/PyTorch versions,
+  and evaluator hashes. Cache hits verify the binary hash. Measurements and numerical
+  checks are always rerun; delete `runs/.build-cache` to force a cold build.
 - Independent evaluator subprocess and source snapshots. Parent and candidate are
   remeasured on the same selected GPU, with order alternated across rounds.
 - Three timing repetitions; acceptance requires >=2% geometric-mean improvement

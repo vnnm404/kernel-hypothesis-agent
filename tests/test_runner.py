@@ -111,3 +111,22 @@ def test_gpu_lease_timeout(tmp_path):
         with pytest.raises(TimeoutError):
             with gpu_lease("0", tmp_path, time.monotonic() + 0.1):
                 pytest.fail("must not enter an occupied lease")
+
+
+def test_workspace_does_not_shadow_python_profiler(tmp_path):
+    work = runner.workspace(tmp_path, config(), "0", str(tmp_path / "locks"))
+    result = subprocess.run(
+        [sys.executable, "-c", "import cProfile; assert callable(cProfile.run)"],
+        cwd=work,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_all_failed_rounds_are_not_cli_success():
+    from kernel_agent.cli import run_succeeded
+
+    assert not run_succeeded({"status": "round_budget", "completed_rounds": 0})
+    assert not run_succeeded({"status": "failed", "completed_rounds": 1})
+    assert run_succeeded({"status": "round_budget", "completed_rounds": 1})

@@ -16,6 +16,13 @@ from .report import build_report
 from .runner import campaign, evaluate, run_trial, tool_version
 
 
+def run_succeeded(state):
+    # Exhausting a budget with every round failed is not a successful pilot.
+    return (
+        state["status"] in {"round_budget", "wall_budget", "token_budget"} and state["completed_rounds"] > 0
+    )
+
+
 def doctor(cfg, backend, gpu):
     checks = {
         "python": sys.version,
@@ -223,12 +230,12 @@ def main(argv=None):
         if a.cmd == "run":
             state = run_trial(cfg, a.out, arm=a.arm, **opts)
             print(build_report(a.out))
-            return 0 if state["status"] in {"round_budget", "wall_budget", "token_budget"} else 1
+            return 0 if run_succeeded(state) else 1
         if a.repetitions < 1 or len(set(a.arms)) != len(a.arms):
             raise ValueError("positive repetitions and unique arms required")
         states = campaign(cfg, a.out, arms=a.arms, repetitions=a.repetitions, order_seed=a.order_seed, **opts)
         print(build_report(a.out))
-        return 0 if all(s["status"] in {"round_budget", "wall_budget", "token_budget"} for s in states) else 1
+        return 0 if all(run_succeeded(s) for s in states) else 1
     except (ValueError, OSError, TimeoutError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

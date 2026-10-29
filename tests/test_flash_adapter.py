@@ -38,7 +38,7 @@ def modules(monkeypatch, *, wrong=False, baseline=True):
         baseline_import_error=lambda t: "missing",
         check_correctness=check,
         measure=measure,
-        build_candidate=lambda *a: calls.append(("build",)),
+        build_candidate=lambda *a: calls.append(("build", a[1])),
     )
     bench.scenarios = SimpleNamespace(
         get_configs=lambda s: [SimpleNamespace(name="a"), SimpleNamespace(name="b")],
@@ -59,7 +59,7 @@ def test_every_seed_and_case_checked_before_timing(tmp_path, monkeypatch):
     seed.write_text("fixture")
     result = flash(config(), seed, tmp_path / "result.json")
     assert calls[:5] == [
-        ("build",),
+        ("build", "FA3_LIB_NAME"),
         ("check", "a", 0),
         ("check", "a", 1),
         ("check", "b", 0),

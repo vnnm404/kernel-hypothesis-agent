@@ -31,8 +31,16 @@ def flash(cfg, candidate, output):
         raise RuntimeError(
             f"required {target.baseline_label} reference unavailable: {E.baseline_import_error(target)}"
         )
-    namespace = "_kha_" + digest(candidate)[:16]
-    E.build_candidate(str(candidate), namespace, str(output.parent / "build"), target)
+    # TORCH_LIBRARY stringifies its argument: the vendored kernels register this
+    # literal token, even when nvcc defines it. Each evaluator loads one kernel.
+    namespace = "FA3_LIB_NAME"
+    build_info = None
+    if os.environ.get("KHA_BUILD_CACHE"):
+        from .build_cache import build
+
+        build_info = build(torch, E, candidate, namespace, target, os.environ["KHA_BUILD_CACHE"])
+    else:
+        E.build_candidate(str(candidate), namespace, str(output.parent / "build"), target)
     rows = []
     # All requested shapes and input seeds must pass before ANY timing is considered.
     for name in cfg["cases"]:
@@ -67,6 +75,7 @@ def flash(cfg, candidate, output):
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "namespace": namespace,
+        "build_cache": build_info,
         "timing": dict(S.PERF),
         "metric": "reference/candidate dispatch-inclusive CUDA-event latency",
         "correctness_seeds": cfg["correctness_seeds"],

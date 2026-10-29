@@ -5,7 +5,7 @@ import os
 import sys
 from pathlib import Path
 
-from .common import ROOT, digest, read_json
+from .common import ROOT, read_json
 
 
 def main():
@@ -29,16 +29,21 @@ def main():
     case = next(c for c in S.get_configs("all") if c.name == a.case)
     inp = S.make_inputs(case, seed=0, device="cuda:0")
     if a.which == "candidate":
-        namespace = "_kha_probe_" + digest(a.candidate)[:16]
-        E.build_candidate(
-            str(a.candidate.resolve()), namespace, str(Path("evidence/build").resolve()), target
-        )
+        namespace = "FA3_LIB_NAME"
+        if os.environ.get("KHA_BUILD_CACHE"):
+            from .build_cache import build
+
+            build(torch, E, a.candidate.resolve(), namespace, target, os.environ["KHA_BUILD_CACHE"])
+        else:
+            E.build_candidate(
+                str(a.candidate.resolve()), namespace, str(Path("evidence/build").resolve()), target
+            )
 
         def run():
             S.call_fwd(namespace, inp)
     else:
         if not E.baseline_available(target):
-            raise RuntimeError("reference unavailable")
+            raise RuntimeError(f"reference unavailable: {E.baseline_import_error(target)}")
 
         def run():
             E.call_baseline(inp, target, normalize_lse=False)

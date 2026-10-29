@@ -26,7 +26,7 @@ measurement at a time. Profiling counters guide diagnosis; report unprofiled lat
 for performance. Keep workloads, reference versions, and input layouts comparable.
 
 For FlashAttention a profiling driver is available:
-`python with_gpu.py ncu --set full --profile-from-start off -o evidence/profile python profile.py --config task.json --candidate candidate.cu --case CASE --which candidate`
+`python with_gpu.py ncu --set full --profile-from-start off -o evidence/profile python profile_kernel.py --config task.json --candidate candidate.cu --case CASE --which candidate`
 Use `--which reference` with a different output prefix for the matching reference.
 If Nsight is unavailable or lacks permissions, save the error and use a different
 test; do not manufacture counters. Record exact commands and raw output.

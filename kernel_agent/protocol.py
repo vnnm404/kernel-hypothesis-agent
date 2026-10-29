@@ -85,14 +85,14 @@ def validate_outcome(outcome, plan, work, require_revision):
         files = outcome.get("evidence_files", [])
         if not files:
             raise ValueError("diagnostic needs saved measurement evidence")
+        has_content = False
         for name in files:
             p = (Path(work) / name).resolve()
-            if (
-                not p.is_relative_to((Path(work) / "evidence").resolve())
-                or not p.is_file()
-                or not p.stat().st_size
-            ):
+            if not p.is_relative_to((Path(work) / "evidence").resolve()) or not p.is_file():
                 raise ValueError(f"missing or invalid evidence file: {name}")
+            has_content |= p.stat().st_size > 0
+        if not has_content:
+            raise ValueError("diagnostic evidence files are all empty")
     if require_revision:
         updates = outcome.get("hypothesis_updates", [])
         expected = {h["id"] for h in plan["hypotheses"]}

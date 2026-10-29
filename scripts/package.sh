@@ -8,7 +8,7 @@ from pathlib import Path
 import tarfile
 paths = ['kernel_agent', 'vendor', 'prompts', 'skills', 'experiments', 'scripts',
          'tests', 'docs', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
-         'PROVENANCE.json', 'pyproject.toml', 'uv.lock', '.gitignore']
+         'PROVENANCE.json', 'pyproject.toml', 'uv.lock', '.gitignore', 'run.sh']
 def clean(info):
     parts = Path(info.name).parts
     if any(p in {'.git', '__pycache__', '.DS_Store', '.pytest_cache', '.env'} for p in parts):
