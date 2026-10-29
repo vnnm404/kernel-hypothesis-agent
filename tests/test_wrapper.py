@@ -9,6 +9,8 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+PAT = 'fake-snowflake-pat'
+SNOWFLAKE = 'https://snowhouse.snowflakecomputing.com/api/v2/cortex/anthropic'
 
 
 class WrapperTests(unittest.TestCase):
@@ -49,37 +51,134 @@ if __name__ == '__main__':
         claude = bins / 'claude'
         claude.write_text(f'#!{sys.executable}\n' + '''import json, os, sys
 from pathlib import Path
-assert 'smallest test' in sys.stdin.read(), 'prompt was not passed on stdin'
-Path(os.environ['CLAUDE_LOG']).write_text(json.dumps(sys.argv))
+Path(os.environ['CLAUDE_LOG']).write_text(json.dumps({'argv': sys.argv, 'stdin': sys.stdin.read(),
+ 'key': os.environ.get('ANTHROPIC_API_KEY'), 'url': os.environ.get('ANTHROPIC_BASE_URL')}))
 if not os.environ.get('NO_RESULT'):
  Path('result.md').write_text('Fixture result; no real GPU or model used.')
+if os.environ.get('CHANGE_BEST'):
+ Path('best.cu').write_text('changed kernel')
 print(json.dumps({'type':'result', 'is_error': bool(os.environ.get('AGENT_ERROR'))}))
 ''')
         for p in bins.iterdir():
             p.chmod(0o755)
-        self.env = os.environ | {'PATH': f'{bins}:/usr/bin:/bin', 'PYTHON_BIN': sys.executable,
-                                  'CALL_LOG': str(self.root / 'calls'), 'CLAUDE_LOG': str(self.root / 'claude-call')}
+        # Fake credentials only: drop inherited auth and use a fixture PAT path.
+        self.pat = self.root / 'fake-pat'
+        self.pat.write_text(PAT + '\n')
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(('ANTHROPIC_', 'CLAUDE_', 'OPENAI_'))}
+        self.env = env | {'PATH': f'{bins}:/usr/bin:/bin', 'PYTHON_BIN': sys.executable, 'SNOWFLAKE_PAT_FILE': str(self.pat),
+                          'CALL_LOG': str(self.root / 'calls'), 'CLAUDE_LOG': str(self.root / 'claude-call')}
 
     def run_wrapper(self, *args, **env):
         return subprocess.run(['bash', str(self.root / 'run.sh'), *args],
                               env=self.env | env, capture_output=True, text=True, timeout=20)
 
+    def calls(self):
+        return [json.loads(s) for s in (self.root / 'calls').read_text().splitlines()]
+
+    def claude_call(self):
+        return json.loads((self.root / 'claude-call').read_text())
+
+    def assertNoSecret(self, r, *secrets):
+        runs = [p.read_text() for p in (self.root / 'runs').rglob('*') if p.is_file()]
+        text = r.stdout + r.stderr + ''.join(runs)
+        for secret in secrets:
+            self.assertNotIn(secret, text)
+
+    def assertStoppedBeforeGpu(self, r, message):
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(message, r.stderr)
+        self.assertNotIn('Ready', r.stdout)
+        self.assertFalse((self.root / 'calls').exists())
+        self.assertFalse((self.root / 'claude-call').exists())
+
     def test_full_run_paths_with_spaces_and_existing_checkout_untouched(self):
         before = {str(p): p.read_bytes() for p in self.flash.rglob('*') if p.is_file()}
-        r = self.run_wrapper(str(self.flash), '--model', 'configured-model')
+        r = self.run_wrapper(str(self.flash), '--model', 'configured-model', CHANGE_BEST='1')
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         after = {str(p): p.read_bytes() for p in self.flash.rglob('*') if p.is_file()}
         self.assertEqual(before, after)
-        calls = [json.loads(s) for s in (self.root / 'calls').read_text().splitlines()]
+        calls = self.calls()
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][calls[0].index('--namespace') + 1], 'FA3_LIB_NAME')
         self.assertTrue(calls[1][calls[1].index('--cand') + 1].endswith('/best.cu'))
-        self.assertIn('configured-model', json.loads((self.root / 'claude-call').read_text()))
+        argv = self.claude_call()['argv']
+        self.assertIn('configured-model', argv)
+        self.assertNotIn('claude-opus-5[1m]', argv)
+        self.assertIn('smallest test', self.claude_call()['stdin'])
 
-    def test_gpu_check_does_not_call_claude(self):
+    def test_unchanged_best_is_rechecked_through_compiled_candidate_path(self):
+        r = self.run_wrapper(str(self.flash))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        calls = self.calls()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][calls[0].index('--cand') + 1], calls[1][calls[1].index('--cand') + 1])
+
+    def test_snowflake_pat_is_default_route_and_never_printed(self):
+        r = self.run_wrapper(str(self.flash), OPENAI_API_KEY='fake-openai-key')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        call = self.claude_call()
+        self.assertEqual((call['key'], call['url']), (PAT, SNOWFLAKE))
+        self.assertEqual(call['argv'][call['argv'].index('--model') + 1], 'claude-opus-5[1m]')
+        self.assertNoSecret(r, PAT, 'fake-openai-key')
+
+    def test_explicit_endpoint_and_key_are_preserved(self):
+        r = self.run_wrapper(str(self.flash), ANTHROPIC_BASE_URL='https://proxy.example/anthropic',
+                             ANTHROPIC_API_KEY='fake-explicit-key')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        call = self.claude_call()
+        self.assertEqual((call['key'], call['url']), ('fake-explicit-key', 'https://proxy.example/anthropic'))
+        self.assertNotIn('--model', call['argv'])
+        self.assertNoSecret(r, PAT, 'fake-explicit-key')
+
+    def test_explicit_snowflake_endpoint_uses_explicit_key(self):
+        r = self.run_wrapper(str(self.flash), ANTHROPIC_BASE_URL=SNOWFLAKE, ANTHROPIC_API_KEY='fake-explicit-key')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.claude_call()['key'], 'fake-explicit-key')
+
+    def test_kda_key_is_reused_when_cortex_is_explicit(self):
+        self.pat.unlink()
+        r = self.run_wrapper(str(self.flash), ANTHROPIC_BASE_URL=SNOWFLAKE,
+                             OPENAI_API_KEY='fake-kda-pat')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.claude_call()['key'], 'fake-kda-pat')
+        self.assertNoSecret(r, 'fake-kda-pat')
+
+    def test_key_without_endpoint_is_not_sent_to_snowflake(self):
+        r = self.run_wrapper(str(self.flash), ANTHROPIC_API_KEY='fake-anthropic-key')
+        self.assertStoppedBeforeGpu(r, 'ANTHROPIC_BASE_URL')
+        self.assertNoSecret(r, PAT, 'fake-anthropic-key')
+
+    def test_missing_pat_fails_before_gpu_work(self):
+        self.pat.unlink()
+        r = self.run_wrapper(str(self.flash), OPENAI_API_KEY='fake-openai-key')
+        self.assertStoppedBeforeGpu(r, 'needs your PAT')
+        self.assertNoSecret(r, 'fake-openai-key')
+
+    def test_gpu_check_needs_no_credentials_and_does_not_call_claude(self):
+        self.pat.unlink()
         r = self.run_wrapper('--check', str(self.flash))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(self.calls()), 1)
         self.assertFalse((self.root / 'claude-call').exists())
+
+    def test_smoke_reads_seed_log_and_rechecks_unchanged_kernel(self):
+        r = self.run_wrapper('--smoke', str(self.flash))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('Smoke test passed (no optimization attempted)', r.stdout)
+        call = self.claude_call()
+        self.assertIn('SMOKE TEST ONLY', call['stdin'])
+        self.assertIn('seed.log', call['stdin'])
+        self.assertEqual(call['argv'][call['argv'].index('--allowedTools') + 1], 'Read,Write')
+        calls = self.calls()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][calls[0].index('--cand') + 1], calls[1][calls[1].index('--cand') + 1])
+
+    def test_smoke_fails_if_claude_changes_best(self):
+        r = self.run_wrapper('--smoke', str(self.flash), CHANGE_BEST='1')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('Smoke test failed', r.stderr)
+        self.assertEqual(len(self.calls()), 1)
 
     def test_missing_reference_stops_before_benchmark_or_agent(self):
         r = self.run_wrapper(str(self.flash), BAD_REFERENCE='1')
