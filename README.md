@@ -10,7 +10,7 @@ cd kernel-hypothesis-agent
 ```
 
 The script downloads flash-cuda and sets up Python/dependencies automatically in `.deps/`,
-benchmarks the seed, runs Claude, and checks the final kernel. First run takes several minutes.
+benchmarks the seed, runs Claude, and checks the final kernel. Allow 20 GB free disk and several minutes initially.
 Quick test without optimization: `./run.sh --smoke`.
 
 Results: `runs/run-*/best.cu`, `result.md`, benchmark logs, and `trace.jsonl`.
